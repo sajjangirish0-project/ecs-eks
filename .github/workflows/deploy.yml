@@ -101,7 +101,7 @@ jobs:
     - name: Deploy Kubernetes Application
       run: |
         # Create namespace
-        kubectl create namespace monitoring
+        # kubectl create namespace monitoring
         
         # Apply deployment
         kubectl apply -f kubernetes/deployment.yaml
