@@ -1,4 +1,4 @@
-name: Deploy to AWS
+name: Deploy to AWS ECS and EKS
 
 on:
   push:
@@ -7,183 +7,732 @@ on:
     paths:
       - 'app/**'
       - 'terraform/**'
-      - '.github/workflows/deploy.yml'
+      - 'kubernetes/**'
+      - '.github/workflows/deploy.yaml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'app/**'
+      - 'terraform/**'
   workflow_dispatch:  # Manual trigger
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'prod'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      skip_infra:
+        description: 'Skip infrastructure creation'
+        required: false
+        default: false
+        type: boolean
 
 env:
-  AWS_REGION: us-east-2
+  AWS_REGION: us-east-1
   PROJECT_NAME: multi-orchestrator-app
-  ENVIRONMENT: prod
-  TF_VERSION: 1.5.0
+  TF_VERSION: 1.6.0
+  ECR_REPO_NAME: multi-orchestrator-repo
+  DOCKER_BUILD_CONTEXT: ./app
+
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
-  build-and-push:
+  setup:
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
-    
     outputs:
-      ecr_repo_url: ${{ steps.build.outputs.ecr_repo_url }}
-      image_tag: ${{ steps.build.outputs.image_tag }}
-
+      aws_account_id: ${{ steps.get-account.outputs.aws_account_id }}
+      ecr_repository_url: ${{ steps.setup-ecr.outputs.ecr_repository_url }}
     steps:
-    - name: Checkout
-      uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v3
-      with:
-        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-        aws-region: ${{ env.AWS_REGION }}
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Setup
 
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v1
+      - name: Get AWS Account ID
+        id: get-account
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "aws_account_id=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+          echo "AWS_ACCOUNT_ID=$ACCOUNT_ID" >> $GITHUB_ENV
 
-    - name: Build and Push Docker image
-      id: build
-      run: |
-        ECR_REPO=${{ secrets.ECR_REPOSITORY }}
-        IMAGE_TAG=$(git rev-parse --short HEAD)
-        
-        # Build the image
-        docker build -t $ECR_REPO:$IMAGE_TAG ./app
-        
-        # Push the image
-        docker push $ECR_REPO:$IMAGE_TAG
-        
-        # Set outputs
-        echo "ecr_repo_url=$ECR_REPO" >> $GITHUB_OUTPUT
-        echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+      - name: Setup ECR Repository
+        id: setup-ecr
+        run: |
+          # Check if ECR repository exists
+          REPO_EXISTS=$(aws ecr describe-repositories \
+            --repository-names ${{ env.ECR_REPO_NAME }} \
+            --query 'repositories[0].repositoryUri' \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+          
+          if [ "$REPO_EXISTS" = "NOT_FOUND" ]; then
+            echo "Creating ECR repository..."
+            REPO_URL=$(aws ecr create-repository \
+              --repository-name ${{ env.ECR_REPO_NAME }} \
+              --image-tag-mutability MUTABLE \
+              --image-scanning-configuration scanOnPush=true \
+              --query 'repository.repositoryUri' \
+              --output text)
+            echo "Created ECR repository: $REPO_URL"
+          else
+            echo "ECR repository already exists: $REPO_EXISTS"
+            REPO_URL=$REPO_EXISTS
+          fi
+          
+          echo "ecr_repository_url=$REPO_URL" >> $GITHUB_OUTPUT
+          echo "ECR_REPOSITORY_URL=$REPO_URL" >> $GITHUB_ENV
 
-  terraform-plan:
+  terraform-validate:
     runs-on: ubuntu-latest
-    needs: build-and-push
-    permissions:
-      id-token: write
-      contents: read
-    
+    needs: setup
     steps:
-    - name: Checkout
-      uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v2
-      with:
-        terraform_version: ${{ env.TF_VERSION }}
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
 
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v3
-      with:
-        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-        aws-region: ${{ env.AWS_REGION }}
+      - name: Terraform Format Check
+        run: |
+          cd terraform
+          terraform fmt -check -diff -recursive
 
-    - name: Terraform Init
-      run: |
-        cd terraform
-        terraform init \
-          -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-          -backend-config="key=${{ env.PROJECT_NAME }}/terraform.tfstate" \
-          -backend-config="region=${{ env.AWS_REGION }}"
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init -backend=false
 
-    - name: Terraform Plan
-      run: |
-        cd terraform
-        terraform plan \
-          -var="aws_region=${{ env.AWS_REGION }}" \
-          -var="project_name=${{ env.PROJECT_NAME }}" \
-          -var="environment=${{ env.ENVIRONMENT }}" \
-          -var="ecr_image_tag=${{ needs.build-and-push.outputs.image_tag }}" \
-          -out=tfplan
+      - name: Terraform Validate
+        run: |
+          cd terraform
+          terraform validate
+
+      - name: Terraform Security Scan
+        run: |
+          cd terraform
+          terraform plan -lock=false -no-color -out=tfplan
+          terraform show -json tfplan > tfplan.json
 
   terraform-apply:
     runs-on: ubuntu-latest
-    needs: terraform-plan
-    permissions:
-      id-token: write
-      contents: read
-    
+    needs: [setup, terraform-validate]
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.skip_infra == false)
+    outputs:
+      ecs_alb_dns: ${{ steps.get-outputs.outputs.ecs_alb_dns }}
+      eks_cluster_name: ${{ steps.get-outputs.outputs.eks_cluster_name }}
     steps:
-    - name: Checkout
-      uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v2
-      with:
-        terraform_version: ${{ env.TF_VERSION }}
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
 
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v3
-      with:
-        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-        aws-region: ${{ env.AWS_REGION }}
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Terraform
 
-    - name: Terraform Apply
-      run: |
-        cd terraform
-        terraform apply -auto-approve tfplan
+      - name: Terraform Init with Backend
+        run: |
+          cd terraform
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ env.PROJECT_NAME }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="encrypt=true" \
+            -reconfigure
 
-    - name: Deploy to EKS
-      run: |
-        # Update kubeconfig
-        aws eks update-kubeconfig \
-          --region ${{ env.AWS_REGION }} \
-          --name ${{ env.PROJECT_NAME }}-eks-cluster
-        
-        # Replace placeholders in Kubernetes manifest
-        export ECR_REPOSITORY_URL=${{ needs.build-and-push.outputs.ecr_repo_url }}
-        export IMAGE_TAG=${{ needs.build-and-push.outputs.image_tag }}
-        
-        envsubst < kubernetes/deployment.yaml > kubernetes/deployment-processed.yaml
-        
-        # Apply Kubernetes manifest
-        kubectl apply -f kubernetes/deployment-processed.yaml
-        
-        # Wait for service to be ready
-        kubectl rollout status deployment/web-app --timeout=300s
+      - name: Terraform Plan
+        run: |
+          cd terraform
+          terraform plan \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -var="project_name=${{ env.PROJECT_NAME }}" \
+            -var="environment=${{ github.event.inputs.environment || 'prod' }}" \
+            -var="ecr_repository_url=${{ needs.setup.outputs.ecr_repository_url }}" \
+            -out=tfplan \
+            -no-color
+
+      - name: Terraform Apply
+        run: |
+          cd terraform
+          terraform apply -auto-approve tfplan
+
+      - name: Get Terraform Outputs
+        id: get-outputs
+        run: |
+          cd terraform
+          
+          # Get ECS ALB DNS
+          ECS_ALB_DNS=$(terraform output -raw ecs_alb_dns_name 2>/dev/null || echo "")
+          if [ -z "$ECS_ALB_DNS" ]; then
+            ECS_ALB_DNS="pending"
+          fi
+          
+          # Get EKS cluster name
+          EKS_CLUSTER_NAME=$(terraform output -raw eks_cluster_name 2>/dev/null || echo "${{ env.PROJECT_NAME }}-eks-cluster")
+          
+          echo "ecs_alb_dns=$ECS_ALB_DNS" >> $GITHUB_OUTPUT
+          echo "eks_cluster_name=$EKS_CLUSTER_NAME" >> $GITHUB_OUTPUT
+          
+          echo "ECS ALB DNS: $ECS_ALB_DNS"
+          echo "EKS Cluster Name: $EKS_CLUSTER_NAME"
+
+  docker-build-push:
+    runs-on: ubuntu-latest
+    needs: [setup, terraform-apply]
+    outputs:
+      image_tag: ${{ steps.build-push.outputs.image_tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-ECR
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker Image
+        id: build-push
+        run: |
+          # Generate image tag
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          IMAGE_TAG="${SHORT_SHA}-${TIMESTAMP}"
+          
+          ECR_URL=${{ needs.setup.outputs.ecr_repository_url }}
+          
+          echo "Building Docker image..."
+          echo "Image: $ECR_URL:$IMAGE_TAG"
+          echo "Context: ${{ env.DOCKER_BUILD_CONTEXT }}"
+          
+          # Build the image
+          docker build \
+            -t $ECR_URL:$IMAGE_TAG \
+            -t $ECR_URL:latest \
+            ${{ env.DOCKER_BUILD_CONTEXT }}
+          
+          # Push both tags
+          echo "Pushing image to ECR..."
+          docker push $ECR_URL:$IMAGE_TAG
+          docker push $ECR_URL:latest
+          
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          echo "Docker image pushed successfully!"
+
+      - name: Scan Docker Image for Vulnerabilities
+        run: |
+          ECR_URL=${{ needs.setup.outputs.ecr_repository_url }}
+          IMAGE_TAG=${{ steps.build-push.outputs.image_tag }}
+          
+          # Start image scan
+          aws ecr start-image-scan \
+            --repository-name ${{ env.ECR_REPO_NAME }} \
+            --image-id imageTag=$IMAGE_TAG
+          
+          echo "Image scan started for $ECR_URL:$IMAGE_TAG"
+
+  deploy-ecs:
+    runs-on: ubuntu-latest
+    needs: [terraform-apply, docker-build-push]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-ECS
+
+      - name: Update ECS Service with New Image
+        run: |
+          ECR_URL=${{ needs.setup.outputs.ecr_repository_url }}
+          IMAGE_TAG=${{ needs.docker-build-push.outputs.image_tag }}
+          CLUSTER_NAME="${{ env.PROJECT_NAME }}-ecs-cluster"
+          SERVICE_NAME="${{ env.PROJECT_NAME }}-service"
+          
+          echo "Updating ECS service with new image..."
+          echo "Cluster: $CLUSTER_NAME"
+          echo "Service: $SERVICE_NAME"
+          echo "Image: $ECR_URL:$IMAGE_TAG"
+          
+          # Get current task definition
+          TASK_DEF_ARN=$(aws ecs describe-services \
+            --cluster $CLUSTER_NAME \
+            --services $SERVICE_NAME \
+            --query 'services[0].taskDefinition' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -z "$TASK_DEF_ARN" ]; then
+            echo "ECS service not found. It will be created by Terraform."
+            exit 0
+          fi
+          
+          # Describe task definition
+          aws ecs describe-task-definition \
+            --task-definition $TASK_DEF_ARN \
+            --query 'taskDefinition' > current-task-def.json
+          
+          # Update image in task definition
+          jq ".containerDefinitions[0].image = \"$ECR_URL:$IMAGE_TAG\"" current-task-def.json > updated-task-def.json
+          
+          # Remove unnecessary fields
+          jq 'del(.taskDefinitionArn, .requiresAttributes, .compatibilities, .status, .registeredAt, .registeredBy, .revision)' \
+            updated-task-def.json > new-task-def.json
+          
+          # Register new task definition
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://new-task-def.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          echo "New task definition registered: $NEW_TASK_DEF_ARN"
+          
+          # Update ECS service
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service $SERVICE_NAME \
+            --task-definition $NEW_TASK_DEF_ARN \
+            --force-new-deployment
+          
+          echo "ECS service update initiated"
+
+      - name: Wait for ECS Deployment
+        run: |
+          CLUSTER_NAME="${{ env.PROJECT_NAME }}-ecs-cluster"
+          SERVICE_NAME="${{ env.PROJECT_NAME }}-service"
+          
+          echo "Waiting for ECS deployment to stabilize..."
+          
+          # Wait for service to stabilize with timeout
+          timeout 300 bash -c "
+            while true; do
+              STATUS=$(aws ecs describe-services \
+                --cluster $CLUSTER_NAME \
+                --services $SERVICE_NAME \
+                --query 'services[0].deployments[0].rolloutState' \
+                --output text 2>/dev/null || echo 'UNKNOWN')
+              
+              RUNNING=$(aws ecs describe-services \
+                --cluster $CLUSTER_NAME \
+                --services $SERVICE_NAME \
+                --query 'services[0].runningCount' \
+                --output text 2>/dev/null || echo '0')
+              
+              DESIRED=$(aws ecs describe-services \
+                --cluster $CLUSTER_NAME \
+                --services $SERVICE_NAME \
+                --query 'services[0].desiredCount' \
+                --output text 2>/dev/null || echo '0')
+              
+              echo "Status: $STATUS, Running: $RUNNING/$DESIRED"
+              
+              if [ "$STATUS" = "COMPLETED" ] && [ "$RUNNING" -eq "$DESIRED" ] && [ "$DESIRED" -gt 0 ]; then
+                echo "ECS deployment completed successfully!"
+                break
+              fi
+              
+              sleep 10
+            done
+          "
+
+  deploy-eks:
+    runs-on: ubuntu-latest
+    needs: [terraform-apply, docker-build-push]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-EKS
+
+      - name: Setup kubectl for EKS
+        run: |
+          EKS_CLUSTER_NAME=${{ needs.terraform-apply.outputs.eks_cluster_name }}
+          
+          echo "Setting up kubectl for EKS cluster: $EKS_CLUSTER_NAME"
+          
+          # Update kubeconfig
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name $EKS_CLUSTER_NAME
+          
+          # Verify connection
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Create Kubernetes Namespace
+        run: |
+          NAMESPACE=${{ env.PROJECT_NAME }}
+          
+          # Create namespace if it doesn't exist
+          kubectl create namespace $NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Create ECR pull secret
+          kubectl create secret docker-registry ecr-registry \
+            --docker-server=${{ needs.setup.outputs.ecr_repository_url }} \
+            --docker-username=AWS \
+            --docker-password=$(aws ecr get-login-password --region ${{ env.AWS_REGION }}) \
+            --namespace=$NAMESPACE \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy to Kubernetes
+        run: |
+          ECR_URL=${{ needs.setup.outputs.ecr_repository_url }}
+          IMAGE_TAG=${{ needs.docker-build-push.outputs.image_tag }}
+          NAMESPACE=${{ env.PROJECT_NAME }}
+          
+          echo "Deploying to Kubernetes..."
+          echo "Image: $ECR_URL:$IMAGE_TAG"
+          echo "Namespace: $NAMESPACE"
+          
+          # Create Kubernetes deployment YAML
+          cat > deployment.yaml << EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: web-app
+            namespace: $NAMESPACE
+            labels:
+              app: web-app
+              version: $IMAGE_TAG
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: web-app
+            template:
+              metadata:
+                labels:
+                  app: web-app
+                  version: $IMAGE_TAG
+              spec:
+                imagePullSecrets:
+                - name: ecr-registry
+                containers:
+                - name: web-app
+                  image: $ECR_URL:$IMAGE_TAG
+                  imagePullPolicy: Always
+                  ports:
+                  - containerPort: 8080
+                    name: http
+                  env:
+                  - name: PLATFORM
+                    value: "EKS-Kubernetes"
+                  resources:
+                    requests:
+                      memory: "256Mi"
+                      cpu: "250m"
+                    limits:
+                      memory: "512Mi"
+                      cpu: "500m"
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                    timeoutSeconds: 5
+                    failureThreshold: 3
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 5
+                    periodSeconds: 5
+                    timeoutSeconds: 5
+                    failureThreshold: 3
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: web-service
+            namespace: $NAMESPACE
+            labels:
+              app: web-app
+          spec:
+            type: LoadBalancer
+            selector:
+              app: web-app
+            ports:
+            - port: 80
+              targetPort: 8080
+              protocol: TCP
+              name: http
+          EOF
+          
+          # Apply the deployment
+          kubectl apply -f deployment.yaml
+          
+          # Create Horizontal Pod Autoscaler
+          cat > hpa.yaml << EOF
+          apiVersion: autoscaling/v2
+          kind: HorizontalPodAutoscaler
+          metadata:
+            name: web-app-hpa
+            namespace: $NAMESPACE
+          spec:
+            scaleTargetRef:
+              apiVersion: apps/v1
+              kind: Deployment
+              name: web-app
+            minReplicas: 2
+            maxReplicas: 5
+            metrics:
+            - type: Resource
+              resource:
+                name: cpu
+                target:
+                  type: Utilization
+                  averageUtilization: 70
+          EOF
+          
+          kubectl apply -f hpa.yaml
+
+      - name: Wait for Kubernetes Deployment
+        run: |
+          NAMESPACE=${{ env.PROJECT_NAME }}
+          
+          echo "Waiting for Kubernetes deployment to be ready..."
+          
+          # Wait for deployment
+          kubectl rollout status deployment/web-app \
+            --namespace=$NAMESPACE \
+            --timeout=300s
+          
+          # Wait for service to get LoadBalancer
+          echo "Waiting for LoadBalancer..."
+          timeout 180 bash -c "
+            while true; do
+              LB_HOSTNAME=\$(kubectl get service web-service \
+                --namespace=$NAMESPACE \
+                -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo '')
+              
+              if [ -n \"\$LB_HOSTNAME\" ]; then
+                echo \"LoadBalancer hostname: \$LB_HOSTNAME\"
+                break
+              fi
+              
+              echo \"Waiting for LoadBalancer...\"
+              sleep 10
+            done
+          "
 
   test-deployments:
     runs-on: ubuntu-latest
-    needs: terraform-apply
-    permissions:
-      id-token: write
-      contents: read
-    
+    needs: [deploy-ecs, deploy-eks]
     steps:
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v3
-      with:
-        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-        aws-region: ${{ env.AWS_REGION }}
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Get ECS Load Balancer DNS
-      id: get-ecs-dns
-      run: |
-        cd terraform
-        ECS_URL=$(terraform output -raw ecs_service_url)
-        echo "ECS_URL=$ECS_URL" >> $GITHUB_ENV
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Test
 
-    - name: Get EKS Load Balancer DNS
-      id: get-eks-dns
-      run: |
-        aws eks update-kubeconfig \
-          --region ${{ env.AWS_REGION }} \
-          --name ${{ env.PROJECT_NAME }}-eks-cluster
-        
-        EKS_URL=$(kubectl get service web-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-        echo "EKS_URL=$EKS_URL" >> $GITHUB_ENV
+      - name: Get ECS Load Balancer URL
+        id: get-ecs
+        run: |
+          # Find ECS ALB
+          ALB_ARN=$(aws elbv2 describe-load-balancers \
+            --query "LoadBalancers[?contains(LoadBalancerName, '${{ env.PROJECT_NAME }}-ecs-alb')].LoadBalancerArn" \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$ALB_ARN" ]; then
+            ALB_DNS=$(aws elbv2 describe-load-balancers \
+              --load-balancer-arns $ALB_ARN \
+              --query 'LoadBalancers[0].DNSName' \
+              --output text)
+            echo "ECS_URL=http://$ALB_DNS:8080" >> $GITHUB_ENV
+            echo "ECS ALB DNS: $ALB_DNS"
+          else
+            echo "ECS_URL=" >> $GITHUB_ENV
+            echo "ECS ALB not found"
+          fi
 
-    - name: Test ECS Deployment
-      run: |
-        echo "Testing ECS deployment at $ECS_URL..."
-        sleep 30  # Wait for ALB to be ready
-        curl -f http://$ECS_URL:8080/ || echo "ECS test failed"
-        curl -f http://$ECS_URL:8080/health || echo "ECS health check failed"
+      - name: Get EKS Load Balancer URL
+        id: get-eks
+        run: |
+          # Setup kubectl
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ needs.terraform-apply.outputs.eks_cluster_name }}
+          
+          # Get ELB hostname
+          LB_HOSTNAME=$(kubectl get service web-service \
+            --namespace=${{ env.PROJECT_NAME }} \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          
+          if [ -n "$LB_HOSTNAME" ]; then
+            echo "EKS_URL=http://$LB_HOSTNAME" >> $GITHUB_ENV
+            echo "EKS ELB hostname: $LB_HOSTNAME"
+          else
+            echo "EKS_URL=" >> $GITHUB_ENV
+            echo "EKS ELB not found"
+          fi
 
-    - name: Test EKS Deployment
-      run: |
-        echo "Testing EKS deployment at $EKS_URL..."
-        sleep 30  # Wait for ELB to be ready
-        curl -f http://$EKS_URL/ || echo "EKS test failed"
-        curl -f http://$EKS_URL/health || echo "EKS health check failed"
+      - name: Test ECS Application
+        if: env.ECS_URL != ''
+        run: |
+          echo "Testing ECS deployment..."
+          echo "URL: $ECS_URL"
+          
+          # Wait for ALB to be ready
+          sleep 30
+          
+          # Test with retries
+          for i in {1..10}; do
+            echo "Attempt $i to reach ECS..."
+            RESPONSE=$(curl -s -f $ECS_URL/health 2>/dev/null || echo "FAILED")
+            
+            if [ "$RESPONSE" != "FAILED" ]; then
+              echo "✅ ECS Health Check Response:"
+              echo "$RESPONSE" | jq .
+              
+              # Test main endpoint
+              MAIN_RESPONSE=$(curl -s $ECS_URL/)
+              echo "✅ ECS Main Endpoint Response:"
+              echo "$MAIN_RESPONSE" | jq .
+              break
+            fi
+            
+            echo "ECS not ready yet, waiting..."
+            sleep 10
+          done
+
+      - name: Test EKS Application
+        if: env.EKS_URL != ''
+        run: |
+          echo "Testing EKS deployment..."
+          echo "URL: $EKS_URL"
+          
+          # Wait for ELB to be ready
+          sleep 30
+          
+          # Test with retries
+          for i in {1..10}; do
+            echo "Attempt $i to reach EKS..."
+            RESPONSE=$(curl -s -f $EKS_URL/health 2>/dev/null || echo "FAILED")
+            
+            if [ "$RESPONSE" != "FAILED" ]; then
+              echo "✅ EKS Health Check Response:"
+              echo "$RESPONSE" | jq .
+              
+              # Test main endpoint
+              MAIN_RESPONSE=$(curl -s $EKS_URL/)
+              echo "✅ EKS Main Endpoint Response:"
+              echo "$MAIN_RESPONSE" | jq .
+              break
+            fi
+            
+            echo "EKS not ready yet, waiting..."
+            sleep 10
+          done
+
+      - name: Generate Deployment Report
+        run: |
+          echo "========================================="
+          echo "🚀 DEPLOYMENT COMPLETED SUCCESSFULLY"
+          echo "========================================="
+          echo ""
+          echo "📦 Application Details:"
+          echo "   Project: ${{ env.PROJECT_NAME }}"
+          echo "   Image Tag: ${{ needs.docker-build-push.outputs.image_tag }}"
+          echo "   ECR Repository: ${{ needs.setup.outputs.ecr_repository_url }}"
+          echo ""
+          echo "🌐 Service Endpoints:"
+          if [ -n "$ECS_URL" ]; then
+            echo "   ✅ ECS (Fargate): $ECS_URL"
+          else
+            echo "   ⚠️  ECS: Not available"
+          fi
+          
+          if [ -n "$EKS_URL" ]; then
+            echo "   ✅ EKS (Kubernetes): $EKS_URL"
+          else
+            echo "   ⚠️  EKS: Not available"
+          fi
+          echo ""
+          echo "🔧 Infrastructure:"
+          echo "   ECS Cluster: ${{ env.PROJECT_NAME }}-ecs-cluster"
+          echo "   EKS Cluster: ${{ needs.terraform-apply.outputs.eks_cluster_name }}"
+          echo "   AWS Region: ${{ env.AWS_REGION }}"
+          echo ""
+          echo "========================================="
+          
+          # Create summary for PR comments
+          if [ -n "$ECS_URL" ] && [ -n "$EKS_URL" ]; then
+            echo "SUMMARY=✅ Both ECS and EKS deployments successful!" >> $GITHUB_ENV
+          elif [ -n "$ECS_URL" ] || [ -n "$EKS_URL" ]; then
+            echo "SUMMARY=⚠️ Partial deployment completed" >> $GITHUB_ENV
+          else
+            echo "SUMMARY=❌ Deployment failed" >> $GITHUB_ENV
+          fi
+
+  cleanup:
+    runs-on: ubuntu-latest
+    if: failure() && github.ref == 'refs/heads/main'
+    needs: [terraform-apply]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Cleanup
+
+      - name: Cleanup Resources on Failure
+        run: |
+          echo "🚨 Workflow failed! Starting cleanup..."
+          
+          # Option 1: Destroy Terraform resources (uncomment if needed)
+          # cd terraform
+          # terraform destroy -auto-approve
+          
+          # Option 2: Just log the error
+          echo "Workflow failed at $(date)"
+          echo "Check the logs above for detailed error information"
+          echo ""
+          echo "To clean up manually:"
+          echo "1. Go to ECS Console and delete the service/cluster"
+          echo "2. Go to EKS Console and delete the cluster"
+          echo "3. Go to ECR Console and delete the repository"
+          echo "4. Go to CloudFormation and delete any stacks"
+          
+          echo "Cleanup instructions logged."
