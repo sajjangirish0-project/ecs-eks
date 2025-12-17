@@ -196,8 +196,14 @@ jobs:
 
     - name: Terraform Apply
       run: |
+        run: |
         cd terraform
-        terraform apply -auto-approve tfplan
+        terraform apply \
+        -var="aws_region=${{ env.AWS_REGION }}" \
+        -var="project_name=${{ env.PROJECT_NAME }}" \
+        -var="environment=${{ env.ENVIRONMENT }}" \
+        -var="ecr_image_tag=${{ needs.build-and-push.outputs.image_tag }}" \
+        -auto-approve
 
     - name: Get Terraform Outputs
       id: terraform-outputs
