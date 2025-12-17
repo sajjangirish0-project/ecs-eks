@@ -5,7 +5,7 @@ module "eks" {
   version = "~> 19.0"
 
   cluster_name    = "${var.project_name}-eks-cluster"
-  cluster_version = "1.32"
+  cluster_version = "1.29"
 
   # Explicitly set IAM role names to avoid length issues
   iam_role_name = "${var.project_name}-eks-role"
