@@ -15,7 +15,7 @@ on:
   workflow_dispatch:  # Manual trigger
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: us-east-2
   PROJECT_NAME: multi-orchestrator-app
   ENVIRONMENT: prod
   TF_VERSION: 1.5.0
