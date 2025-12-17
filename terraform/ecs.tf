@@ -18,6 +18,15 @@ module "ecs" {
   }
 }
 
+resource "aws_cloudwatch_log_group" "ecs_logs" {
+  name              = "/ecs/${var.project_name}"
+  retention_in_days = 7
+  
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+  }
+}
 resource "aws_ecs_task_definition" "app" {
   family                   = "${var.project_name}-task"
   network_mode             = "awsvpc"
