@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-app
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web-app
+  template:
+    metadata:
+      labels:
+        app: web-app
+    spec:
+      containers:
+      - name: web-app
+        image: ${ECR_REPOSITORY_URL}:${IMAGE_TAG}
+        ports:
+        - containerPort: 8080
+        env:
+        - name: PLATFORM
+          value: "EKS-Kubernetes"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-service
+spec:
+  type: LoadBalancer
+  selector:
+    app: web-app
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
