@@ -66,3 +66,6 @@ jobs:
           -var="environment=${{ env.ENVIRONMENT }}" \
           -var="ecr_image_tag=${{ env.ECR_IMAGE_TAG }}" \
           -auto-approve
+    - name: Deploy Kubernetes Application
+      run: |
+        kubectl apply -f kubernetes/deployment.yaml
