@@ -100,8 +100,6 @@ jobs:
     
     - name: Deploy Kubernetes Application
       run: |
-        # Create namespace
-        kubectl create namespace multi-orchestrator-app --dry-run=client -o yaml | kubectl apply -f -
         
         # Apply deployment
         kubectl apply -f kubernetes/deployment.yaml
