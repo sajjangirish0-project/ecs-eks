@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
       - name: web-app
-        image: ${ECR_REPOSITORY_URL}:${IMAGE_TAG}
+        image: 646671391335.dkr.ecr.us-east-2.amazonaws.com/multi-orchestrator-app-repository:latest
         ports:
         - containerPort: 8080
         env:
