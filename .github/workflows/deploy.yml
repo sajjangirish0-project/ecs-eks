@@ -1,45 +1,151 @@
-name: Deploy to AWS
+# name: Deploy to AWS
+
+# on:
+#   push:
+#     branches: [main]
+#   workflow_dispatch:
+
+# env:
+#   AWS_REGION: us-east-2
+#   PROJECT_NAME: multi-orchestrator-app
+#   ENVIRONMENT: prod
+#   ECR_IMAGE_TAG: latest
+
+# jobs:
+#   validate-terraform:
+#     runs-on: ubuntu-latest
+#     steps:
+#     - name: Checkout
+#       uses: actions/checkout@v3
+    
+#     - name: Setup Terraform
+#       uses: hashicorp/setup-terraform@v2
+    
+#     - name: Terraform Init
+#       run: |
+#         cd terraform
+#         terraform init -backend=false
+    
+#     - name: Terraform Validate
+#       run: |
+#         cd terraform
+#         terraform validate
+  
+#   terraform-apply:
+#     runs-on: ubuntu-latest
+#     needs: validate-terraform
+#     steps:
+#     - name: Checkout
+#       uses: actions/checkout@v3
+    
+#     - name: Setup Terraform
+#       uses: hashicorp/setup-terraform@v2
+    
+#     - name: Configure AWS Credentials
+#       uses: aws-actions/configure-aws-credentials@v3
+#       with:
+#         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#         aws-region: us-east-2
+    
+#     - name: Terraform Init with Backend
+#       run: |
+#         cd terraform
+#         terraform init \
+#           -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+#           -backend-config="key=${{ env.PROJECT_NAME }}/terraform.tfstate" \
+#           -backend-config="region=${{ env.AWS_REGION }}" \
+#           -backend-config="encrypt=true"
+    
+#     - name: Terraform Apply
+#       run: |
+#         cd terraform
+#         terraform apply \
+#           -var="aws_region=${{ env.AWS_REGION }}" \
+#           -var="project_name=${{ env.PROJECT_NAME }}" \
+#           -var="environment=${{ env.ENVIRONMENT }}" \
+#           -var="ecr_image_tag=${{ env.ECR_IMAGE_TAG }}" \
+#           -auto-approve
+#   deploy-to-eks:
+#     runs-on: ubuntu-latest
+#     needs: terraform-apply
+    
+#     steps:
+#     - name: Checkout
+#       uses: actions/checkout@v3
+    
+#     - name: Configure AWS Credentials
+#       uses: aws-actions/configure-aws-credentials@v3
+#       with:
+#         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#         aws-region: us-east-2
+    
+#     - name: Configure kubectl for EKS (FIXED)
+#       run: |
+#         # First, update kubeconfig for EKS cluster
+#         aws eks update-kubeconfig \
+#           --region us-east-2 \
+#           --name multi-orchestrator-app-eks-cluster
+        
+#         # Verify the context is set correctly
+#         echo "Current kubectl context:"
+#         kubectl config current-context
+        
+#         echo "Available contexts:"
+#         kubectl config get-contexts
+        
+#         echo "Testing cluster connection..."
+#         kubectl cluster-info
+    
+#     - name: Deploy Kubernetes Application
+#       run: |
+#         # Create namespace
+#         # kubectl create namespace monitoring
+        
+#         # Apply deployment
+#         kubectl apply -f kubernetes/deployment.yaml
+      
+#   terraform-Destroy:
+#     runs-on: ubuntu-latest
+#     needs: validate-terraform
+#     steps:
+#     - name: Checkout
+#       uses: actions/checkout@v3
+    
+#     - name: Setup Terraform
+#       uses: hashicorp/setup-terraform@v2
+    
+#     - name: Configure AWS Credentials
+#       uses: aws-actions/configure-aws-credentials@v3
+#       with:
+#         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#         aws-region: us-east-2
+    
+#     - name: Terraform Init with Backend
+#       run: |
+#         cd terraform
+#         terraform init
+#         terraform destroy -auto-approve
+  
+name: Destroy Infrastructure
 
 on:
-  push:
-    branches: [main]
-  workflow_dispatch:
+  workflow_dispatch:  # Manual trigger only
 
 env:
   AWS_REGION: us-east-2
   PROJECT_NAME: multi-orchestrator-app
   ENVIRONMENT: prod
-  ECR_IMAGE_TAG: latest
 
 jobs:
-  validate-terraform:
+  destroy-kubernetes:
     runs-on: ubuntu-latest
+    
     steps:
     - name: Checkout
       uses: actions/checkout@v3
-    
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v2
-    
-    - name: Terraform Init
-      run: |
-        cd terraform
-        terraform init -backend=false
-    
-    - name: Terraform Validate
-      run: |
-        cd terraform
-        terraform validate
-  
-  terraform-apply:
-    runs-on: ubuntu-latest
-    needs: validate-terraform
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v3
-    
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v2
     
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v3
@@ -48,27 +154,60 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: us-east-2
     
-    - name: Terraform Init with Backend
+    - name: Delete Kubernetes Resources
+      run: |
+        echo "🗑️ Deleting Kubernetes resources..."
+        
+        # Configure kubectl
+        aws eks update-kubeconfig \
+          --region us-east-2 \
+          --name multi-orchestrator-app-eks-cluster || echo "EKS cluster may not exist"
+        
+        # Delete all resources
+        kubectl delete -f kubernetes/deployment.yaml --ignore-not-found=true
+        
+        # Delete namespace
+        kubectl delete namespace multi-orchestrator-app --ignore-not-found=true
+        
+        echo "✅ Kubernetes resources deleted"
+
+  destroy-terraform:
+    runs-on: ubuntu-latest
+    needs: destroy-kubernetes
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+    
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v3
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-2
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+    
+    - name: Terraform Destroy
       run: |
         cd terraform
         terraform init \
           -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
           -backend-config="key=${{ env.PROJECT_NAME }}/terraform.tfstate" \
-          -backend-config="region=${{ env.AWS_REGION }}" \
-          -backend-config="encrypt=true"
-    
-    - name: Terraform Apply
-      run: |
-        cd terraform
-        terraform apply \
+          -backend-config="region=${{ env.AWS_REGION }}"
+        
+        echo "🔥 Destroying all infrastructure..."
+        terraform destroy -auto-approve \
           -var="aws_region=${{ env.AWS_REGION }}" \
           -var="project_name=${{ env.PROJECT_NAME }}" \
-          -var="environment=${{ env.ENVIRONMENT }}" \
-          -var="ecr_image_tag=${{ env.ECR_IMAGE_TAG }}" \
-          -auto-approve
-  deploy-to-eks:
+          -var="environment=${{ env.ENVIRONMENT }}"
+        echo "✅ Terraform destruction complete"
+
+  cleanup:
     runs-on: ubuntu-latest
-    needs: terraform-apply
+    needs: destroy-terraform
+    if: always()
     
     steps:
     - name: Checkout
@@ -81,50 +220,14 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: us-east-2
     
-    - name: Configure kubectl for EKS (FIXED)
+    - name: Final Cleanup
       run: |
-        # First, update kubeconfig for EKS cluster
-        aws eks update-kubeconfig \
-          --region us-east-2 \
-          --name multi-orchestrator-app-eks-cluster
+        echo "🧹 Final cleanup..."
         
-        # Verify the context is set correctly
-        echo "Current kubectl context:"
-        kubectl config current-context
+        # Delete ECR repository
+        aws ecr delete-repository \
+          --repository-name multi-orchestrator-app-repository \
+          --force \
+          --region us-east-2 2>/dev/null || echo "ECR repository not found"
         
-        echo "Available contexts:"
-        kubectl config get-contexts
-        
-        echo "Testing cluster connection..."
-        kubectl cluster-info
-    
-    - name: Deploy Kubernetes Application
-      run: |
-        # Create namespace
-        # kubectl create namespace monitoring
-        
-        # Apply deployment
-        kubectl apply -f kubernetes/deployment.yaml
-      
-  terraform-Destroy:
-    runs-on: ubuntu-latest
-    needs: validate-terraform
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v3
-    
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v2
-    
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v3
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: us-east-2
-    
-    - name: Terraform Init with Backend
-      run: |
-        cd terraform
-        terraform init
-        terraform destroy -auto-approve  
+        echo "✅ Cleanup complete"
