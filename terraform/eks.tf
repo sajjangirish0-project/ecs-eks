@@ -1,3 +1,5 @@
+# eks.tf - Update the EKS module configuration
+
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "~> 19.0"
@@ -5,11 +7,23 @@ module "eks" {
   cluster_name    = "${var.project_name}-eks-cluster"
   cluster_version = "1.28"
 
+  # Explicitly set IAM role names to avoid length issues
+  iam_role_name = "${var.project_name}-eks-role"
+  
+  # Prevent the module from adding prefixes
+  iam_role_use_name_prefix = false
+  
+  # Create a custom IAM role instead of using the module's default
+  create_iam_role = true
+
   vpc_id                   = module.vpc.vpc_id
   subnet_ids               = module.vpc.private_subnets
   control_plane_subnet_ids = module.vpc.private_subnets
 
-  # EKS Managed Node Group
+  # Enable EKS control plane logging
+  cluster_enabled_log_types = ["api", "audit", "authenticator", "controllerManager", "scheduler"]
+
+  # EKS Managed Node Group - Keep this configuration
   eks_managed_node_groups = {
     default = {
       min_size     = 2
@@ -21,44 +35,14 @@ module "eks" {
 
       tags = {
         Environment = var.environment
+        Project     = var.project_name
       }
     }
   }
 
   tags = {
     Environment = var.environment
+    Project     = var.project_name
+    Terraform   = "true"
   }
-}
-
-# EKS IAM Roles
-resource "aws_iam_role" "eks_node_role" {
-  name = "${var.project_name}-eks-node-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow"
-        Principal = {
-          Service = "ec2.amazonaws.com"
-        }
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy_attachment" "eks_worker_node_policy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
-  role       = aws_iam_role.eks_node_role.name
-}
-
-resource "aws_iam_role_policy_attachment" "eks_cni_policy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
-  role       = aws_iam_role.eks_node_role.name
-}
-
-resource "aws_iam_role_policy_attachment" "eks_container_registry_policy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
-  role       = aws_iam_role.eks_node_role.name
 }
