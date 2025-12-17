@@ -74,24 +74,3 @@ module "vpc" {
     Project     = var.project_name
   }
 }
-
-# Outputs
-output "ecr_repository_url" {
-  value = module.ecr.repository_url
-}
-
-output "ecs_service_url" {
-  value = module.ecs.alb_dns_name
-}
-
-output "eks_service_url" {
-  value = kubernetes_service.web_service.status[0].load_balancer[0].ingress[0].hostname
-}
-
-output "ecs_task_definition_arn" {
-  value = module.ecs.task_definition_arn
-}
-
-output "eks_cluster_endpoint" {
-  value = module.eks.cluster_endpoint
-}
