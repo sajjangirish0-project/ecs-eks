@@ -57,13 +57,14 @@ output "public_subnets" {
   value       = module.vpc.public_subnets
 }
 
-# Combined Service URLs (for easy access)
+# Combined Service URLs
 output "ecs_service_url" {
   description = "Full URL to access ECS service"
   value       = "http://${aws_lb.ecs.dns_name}:8080"
 }
 
-output "eks_service_url" {
-  description = "Full URL to access EKS service"
-  value       = "http://${kubernetes_service.web_service.status[0].load_balancer[0].ingress[0].hostname}"
-}
+# Comment out or simplify EKS service URL until it's properly defined
+# output "eks_service_url" {
+#   description = "Full URL to access EKS service"
+#   value       = "Pending - will be available after deployment"
+# }
