@@ -36,3 +36,8 @@ module "ecr" {
     Project     = var.project_name
   }
 }
+
+# Data source to get the existing ECR repository URL
+data "aws_ecr_repository" "existing" {
+  name = "${var.project_name}-repository"
+}

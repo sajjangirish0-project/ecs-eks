@@ -29,7 +29,8 @@ resource "aws_ecs_task_definition" "app" {
 
   container_definitions = jsonencode([{
     name  = "web-app"
-    image = "${module.ecr.repository_url}:${var.ecr_image_tag}"
+    # FIXED: Use direct ECR URL instead of module output
+    image = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/${var.project_name}-repository:${var.ecr_image_tag}"
     portMappings = [{
       containerPort = 8080
       hostPort      = 8080
