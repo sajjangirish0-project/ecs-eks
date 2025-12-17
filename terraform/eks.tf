@@ -6,6 +6,8 @@ module "eks" {
 
   cluster_name    = "${var.project_name}-eks-cluster"
   cluster_version = "1.29"
+  cluster_endpoint_public_access  = true
+  cluster_endpoint_private_access = true
 
   # Explicitly set IAM role names to avoid length issues
   iam_role_name = "${var.project_name}-eks-role"
