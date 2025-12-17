@@ -16,12 +16,6 @@ terraform {
     }
   }
 
-  backend "s3" {
-    Configure via environment variables or terraform init -backend-config
-    bucket = "aws-terraform-state-bucket-eks"
-    key    = "multi-orchestrator/terraform.tfstate"
-    region = "us-east-2"
-  }
 }
 
 provider "aws" {
