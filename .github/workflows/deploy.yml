@@ -2,28 +2,14 @@ name: Deploy to AWS
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - 'app/**'
-      - 'terraform/**'
-      - '.github/workflows/deploy.yml'
-      - 'kubernetes/**'
-  pull_request:
-    branches:
-      - main
-  workflow_dispatch:  # Manual trigger
+    branches: [main]
+  workflow_dispatch:
 
 env:
   AWS_REGION: us-east-2
   PROJECT_NAME: multi-orchestrator-app
   ENVIRONMENT: prod
-  TF_VERSION: 1.5.0
-  KUBERNETES_VERSION: 1.28
-
-permissions:
-  id-token: write
-  contents: read
+  ECR_IMAGE_TAG: latest
 
 jobs:
   validate-terraform:
@@ -31,266 +17,51 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v3
-
+    
     - name: Setup Terraform
       uses: hashicorp/setup-terraform@v2
-      with:
-        terraform_version: ${{ env.TF_VERSION }}
-
-    - name: Terraform Format
-      run: |
-        cd terraform
-        terraform fmt -recursive
-
+    
     - name: Terraform Init
       run: |
         cd terraform
         terraform init -backend=false
-
+    
     - name: Terraform Validate
       run: |
         cd terraform
         terraform validate
-
-  build-and-push:
+  
+  terraform-apply:
     runs-on: ubuntu-latest
     needs: validate-terraform
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    
-    outputs:
-      ecr_repo_url: ${{ steps.build.outputs.ecr_repo_url }}
-      image_tag: ${{ steps.build.outputs.image_tag }}
-
     steps:
     - name: Checkout
       uses: actions/checkout@v3
-
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v3
-      with:
-        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-        aws-region: ${{ env.AWS_REGION }}
-
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v1
-
-    - name: Build Docker image
-      id: build
-      run: |
-        # Generate unique image tag
-        IMAGE_TAG=$(git rev-parse --short HEAD)-$(date +%s)
-        
-        # Build the image
-        docker build -t ${{ env.PROJECT_NAME }}:latest ./app
-        
-        # Set outputs
-        echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-
-    - name: Configure AWS CLI
-      run: |
-        aws configure set region ${{ env.AWS_REGION }}
-
-    - name: Get ECR Repository URL
-      id: ecr
-      run: |
-        # Get ECR repository URL (repository will be created by Terraform)
-        ECR_URL=$(aws ecr describe-repositories \
-          --repository-names ${{ env.PROJECT_NAME }}-repository \
-          --query 'repositories[0].repositoryUri' \
-          --output text 2>/dev/null || echo "")
-        
-        if [ -z "$ECR_URL" ]; then
-          echo "ECR repository not found, will be created by Terraform"
-          # Use a placeholder that will be replaced after Terraform apply
-          ECR_URL="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.PROJECT_NAME }}-repository"
-        fi
-        
-        echo "ecr_repo_url=$ECR_URL" >> $GITHUB_OUTPUT
-        echo "ECR_URL=$ECR_URL" >> $GITHUB_ENV
-
-    - name: Tag and Push Docker image
-      run: |
-        # Tag the image
-        docker tag ${{ env.PROJECT_NAME }}:latest $ECR_URL:${{ steps.build.outputs.image_tag }}
-        
-        # Push to ECR
-        docker push $ECR_URL:${{ steps.build.outputs.image_tag }}
-        
-        # Also tag as latest
-        docker tag ${{ env.PROJECT_NAME }}:latest $ECR_URL:latest
-        docker push $ECR_URL:latest
-
-  terraform-plan:
-    runs-on: ubuntu-latest
-    needs: [validate-terraform, build-and-push]
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v3
-
     - name: Setup Terraform
       uses: hashicorp/setup-terraform@v2
-      with:
-        terraform_version: ${{ env.TF_VERSION }}
-
+    
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v3
       with:
         role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
         aws-region: ${{ env.AWS_REGION }}
-
-    - name: Terraform Init
+    
+    - name: Terraform Init with Backend
       run: |
         cd terraform
         terraform init \
           -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-          -backend-config="key=${{ env.PROJECT_NAME }}/${{ env.ENVIRONMENT }}/terraform.tfstate" \
+          -backend-config="key=${{ env.PROJECT_NAME }}/terraform.tfstate" \
           -backend-config="region=${{ env.AWS_REGION }}" \
           -backend-config="encrypt=true"
-
-    - name: Terraform Plan
+    
+    - name: Terraform Apply
       run: |
         cd terraform
-        terraform plan \
+        terraform apply \
           -var="aws_region=${{ env.AWS_REGION }}" \
           -var="project_name=${{ env.PROJECT_NAME }}" \
           -var="environment=${{ env.ENVIRONMENT }}" \
-          -var="ecr_image_tag=${{ needs.build-and-push.outputs.image_tag }}" \
-          -out=tfplan
-        
-        # Save plan as artifact
-        terraform show -json tfplan > tfplan.json
-
-    - name: Upload Terraform Plan
-      uses: actions/upload-artifact@v4
-      with:
-        name: terraform-plan
-        path: terraform/tfplan.json
-
-  terraform-apply:
-    runs-on: ubuntu-latest
-    needs: terraform-plan
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v3
-
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v2
-      with:
-        terraform_version: ${{ env.TF_VERSION }}
-
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v3
-      with:
-        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-        aws-region: ${{ env.AWS_REGION }}
-
-    - name: Download Terraform Plan
-      uses: actions/download-artifact@v4
-      with:
-        name: terraform-plan
-
-    - name: Terraform Apply
-      run: |
-        run: |
-        cd terraform
-        terraform apply \
-        -var="aws_region=${{ env.AWS_REGION }}" \
-        -var="project_name=${{ env.PROJECT_NAME }}" \
-        -var="environment=${{ env.ENVIRONMENT }}" \
-        -var="ecr_image_tag=${{ needs.build-and-push.outputs.image_tag }}" \
-        -auto-approve
-
-    - name: Get Terraform Outputs
-      id: terraform-outputs
-      run: |
-        cd terraform
-        ECR_URL=$(terraform output -raw ecr_repository_url)
-        ECS_ALB_DNS=$(terraform output -raw ecs_alb_dns_name)
-        EKS_CLUSTER_NAME=$(terraform output -raw eks_cluster_name)
-        
-        echo "ecr_url=$ECR_URL" >> $GITHUB_OUTPUT
-        echo "ecs_alb_dns=$ECS_ALB_DNS" >> $GITHUB_OUTPUT
-        echo "eks_cluster_name=$EKS_CLUSTER_NAME" >> $GITHUB_OUTPUT
-
-    - name: Update Kubernetes Deployment
-      run: |
-        # Update kubeconfig for EKS cluster
-        aws eks update-kubeconfig \
-          --region ${{ env.AWS_REGION }} \
-          --name ${{ steps.terraform-outputs.outputs.eks_cluster_name }}
-        
-        # Create namespace if not exists
-        kubectl create namespace ${{ env.PROJECT_NAME }} --dry-run=client -o yaml | kubectl apply -f -
-        
-        # Process and apply Kubernetes deployment
-        export ECR_REPOSITORY_URL=${{ steps.terraform-outputs.outputs.ecr_url }}
-        export IMAGE_TAG=${{ needs.build-and-push.outputs.image_tag }}
-        export NAMESPACE=${{ env.PROJECT_NAME }}
-        
-        # Install envsubst if not available
-        sudo apt-get update && sudo apt-get install -y gettext-base
-        
-        # Substitute variables in deployment file
-        envsubst < kubernetes/deployment.yaml > kubernetes/deployment-processed.yaml
-        
-        # Apply Kubernetes resources
-        kubectl apply -f kubernetes/deployment-processed.yaml
-        
-        # Wait for deployment to be ready
-        kubectl rollout status deployment/web-app \
-          --namespace=${{ env.PROJECT_NAME }} \
-          --timeout=300s
-
-  test-deployments:
-    runs-on: ubuntu-latest
-    needs: terraform-apply
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v3
-
-    - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v3
-      with:
-        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-        aws-region: ${{ env.AWS_REGION }}
-
-    - name: Get Deployment URLs
-      id: urls
-      run: |
-        # Get ECS ALB DNS
-        cd terraform
-        ECS_URL=$(terraform output -raw ecs_alb_dns_name)
-        echo "ECS_URL=$ECS_URL" >> $GITHUB_ENV
-        
-        # Get EKS ELB DNS
-        aws eks update-kubeconfig \
-          --region ${{ env.AWS_REGION }} \
-          --name ${{ env.PROJECT_NAME }}-eks-cluster
-        
-        EKS_URL=$(kubectl get service web-service \
-          --namespace=${{ env.PROJECT_NAME }} \
-          -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
-        echo "EKS_URL=$EKS_URL" >> $GITHUB_ENV
-
-    - name: Wait for Load Balancers
-      run: |
-        echo "Waiting for load balancers to become active..."
-        sleep 60
-
-    - name: Test ECS Deployment
-      run: |
-        echo "Testing ECS deployment at http://$ECS_URL:8080"
-        
-        # Try multiple times with retries
-        for i in {1..10}; do
-          echo "Attempt $i to reach ECS..."
-          if curl -f -s -o /dev/null -w "%{http_code}" http://$ECS_URL:8080/health | grep -q "200"; then
-            echo "ECS is responding!"
-            curl http://$ECS_URL
+          -var="ecr_image_tag=${{ env.ECR_IMAGE_TAG }}" \
+          -auto-approve
